@@ -27,3 +27,16 @@ uv run --locked uvicorn server:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
 The current `/generate` endpoint accepts `prompt` as a query parameter.
+
+To run a command:
+
+```powershell
+$payload = @{ prompt = "Explain KV caching." } | ConvertTo-Json
+
+Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://127.0.0.1:8000/generate" `
+    -ContentType "application/json" `
+    -Body $payload
+```
+

@@ -1,8 +1,14 @@
 from fastapi import Depends, FastAPI, Request
 from typing import Annotated
+from pydantic import BaseModel
 from contextlib import asynccontextmanager
-
+from threading import Lock
 from engine import InferenceEngine
+
+generation_lock = Lock()
+
+class GenerateRequest(BaseModel): #pydantic helps with serialization and validation of request data to match schemas
+    prompt: str
 
 @asynccontextmanager # creates lifespan as a context manager
 async def lifespan(app: FastAPI):
@@ -21,5 +27,6 @@ async def get_engine(request: Request):
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/generate") #Depends takes a provider function that fast API expects, instead of an actual instance 
-def generate(prompt: str, engine: Annotated[InferenceEngine, Depends(get_engine)]): 
-    return engine.generate(prompt)
+def generate(request: GenerateRequest, engine: Annotated[InferenceEngine, Depends(get_engine)]): 
+    with generation_lock: # ensures that only one request can access the model at a time for sequential inference
+        return engine.generate(request.prompt)
