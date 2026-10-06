@@ -3,11 +3,34 @@ import time
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
+class InferenceEngine:
+
+    def __init__(self, model):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = AutoModelForCausalLM.from_pretrained(model, dtype="auto").to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model)
+        
+        print("model device: ", self.model.device)
+
+    def generate(self, prompt):
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+        
+        model_inputs = self.tokenizer.apply_chat_template( #instruct model
+            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True,
+        ).to(self.device)
+                
+        output = cache_inference_loop(prompt, self.model, self.device, self.tokenizer, model_inputs, max_new_tokens=512)
+        print("output: ", output)
+        return output
+
 def sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
-def standard_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=50):
+def standard_inference_loop(prompt, model, device, tokenizer, model_inputs, max_new_tokens=50):
     model_inputs = {
         key: value.clone()
         for key, value in model_inputs.items()
@@ -54,7 +77,7 @@ def standard_inference_loop(model, device, tokenizer, model_inputs, max_new_toke
     return output
     
 
-def cache_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=50):
+def cache_inference_loop(prompt, model, device, tokenizer, model_inputs, max_new_tokens=50):
     sync()
     start = time.perf_counter()
     model.eval()
