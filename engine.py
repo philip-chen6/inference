@@ -23,7 +23,7 @@ class InferenceEngine:
             messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True,
         ).to(self.device)
                 
-        output = cache_inference_loop(self.model, self.device, self.tokenizer, model_inputs, max_new_tokens=512)
+        output = cache_inference_loop(self.model, self.device, self.tokenizer, model_inputs, max_new_tokens=512)[0]
         print("output: ", output)
         return output
 
@@ -40,8 +40,8 @@ class InferenceEngine:
         #batch tokenize together
         model_inputs = self.tokenizer(message_templates, padding=True, return_tensors="pt").to(self.device)
         outputs = cache_inference_loop(self.model, self.device, self.tokenizer, model_inputs, max_new_tokens = 512)
-        for i in range(len(outputs)):
-            print("output " + i+1 + ": ", outputs[i])
+        for i, output in enumerate(outputs, start=1):
+            print(f"output {i}: {output}")
         return outputs
     
 def sync():
@@ -108,38 +108,52 @@ def cache_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=
 
         past_key_values = outputs.past_key_values # store the past key values for the next iteration
         next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) #By default, a reduction like argmax removes the dimension it operates over. keep dim true same as unsqueeze above as model expects input of size [batch, seq_len]
-        generated_tokens = [next_tokens.tolist()] # store generated tokens as list of lists to account for batch size
+        generated_tokens = next_tokens.tolist() # store generated tokens as list of lists to account for batch size
         # Track which sequences in the batch have hit EOS
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        
+        finished = next_tokens.squeeze(-1).eq(tokenizer.eos_token_id)
+        attention_mask = model_inputs["attention_mask"]
+
+        next_tokens = next_tokens.masked_fill(finished.unsqueeze(-1), tokenizer.pad_token_id) # replace "finished" sequences with pad token to avoid recording further tokens for them
         sync()
         first_token_time = time.perf_counter()
         for i in range(max_new_tokens - 1): # we already generated one token, so we only need to generate max_new_tokens - 1 more
-            outputs = model(next_token, past_key_values=past_key_values, use_cache=True) # pass in the next token and the past key values
-            past_key_values = outputs.past_key_values
-            next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True).tolist() # keepdim=True to maintain the shape of the tensor for concatenation
-            for b in range(batch_size):
-                generated_tokens[b].append(next_tokens[b][0])
-            
-
-            if next_token == tokenizer.eos_token_id:
+            if finished.all().item(): # if all sequences in the batch have hit EOS, we can stop generating
                 break
 
+            attention_mask = torch.cat([attention_mask, attention_mask.new_ones((batch_size, 1))], dim=-1) # append a 1 to the attention_mask sequence dimension to have it grow with new tokens.
+            
+            outputs = model(next_tokens, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True) # pass in the next token and the past key values
+            past_key_values = outputs.past_key_values
+            next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) # keepdim=True to maintain the shape of the tensor for concatenation
+            token_ids = next_tokens.squeeze(-1)
+            token_values = token_ids.tolist()
+            already_finished = finished.tolist()
+            for b in range(batch_size):
+                if not already_finished[b]: # if the sequence has not finished, append the next token to the generated tokens
+                    generated_tokens[b].append(token_values[b])
+            
+            finished = finished | token_ids.eq(tokenizer.eos_token_id) # update finished sequences AFTER appending the token.
+
+            next_tokens = next_tokens.masked_fill(finished.unsqueeze(-1), tokenizer.pad_token_id) 
+
+    sync()
     end = time.perf_counter()
 
+    tokens_per_request = [len(ids) for ids in generated_tokens]
+    total_tokens = sum(tokens_per_request)
     ttft = first_token_time - start
-    tps = (len(generated_tokens)-1) / (end - first_token_time)
+    tps = (total_tokens - batch_size) / (end - first_token_time)
     total_time = end - start
-    throughput = len(generated_tokens) / total_time
+    throughput = total_tokens / total_time
     print(f"Start: {start:.4f}")
     print(f"First token: {first_token_time:.4f}")
     print(f"End: {end:.4f}")
     print(f"Total time: {total_time:.4f} seconds")
-    print(f"Tokens generated: {len(generated_tokens)}")
+    print(f"Tokens generated: {total_tokens}")
     print(f"Time to first token: {ttft:.4f} seconds")
     print(f"Tokens per second: {tps:.4f}")
     print(f"Throughput: {throughput:.4f} tokens/second")
-    output = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+    output = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
     return output
 
 def main():
