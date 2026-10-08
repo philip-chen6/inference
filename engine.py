@@ -9,6 +9,7 @@ class InferenceEngine:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = AutoModelForCausalLM.from_pretrained(model, dtype="auto").to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(model)
+        self.tokenizer.padding_side = "left"
         
         print("model device: ", self.model.device)
 
@@ -22,15 +23,32 @@ class InferenceEngine:
             messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True,
         ).to(self.device)
                 
-        output = cache_inference_loop(prompt, self.model, self.device, self.tokenizer, model_inputs, max_new_tokens=512)
+        output = cache_inference_loop(self.model, self.device, self.tokenizer, model_inputs, max_new_tokens=512)
         print("output: ", output)
         return output
 
+    def batch_generate(self, prompts):
+        #create list of chat messages for each prompt
+        messages = [
+                    [{"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt}] for prompt in prompts
+        ]
+        #apply chat template to each without tokenizing
+        message_templates = [self.tokenizer.apply_chat_template(message, 
+            tokenize=False, add_generation_prompt=True) for message in messages]
+
+        #batch tokenize together
+        model_inputs = self.tokenizer(message_templates, padding=True, return_tensors="pt").to(self.device)
+        outputs = cache_inference_loop(self.model, self.device, self.tokenizer, model_inputs, max_new_tokens = 512)
+        for i in range(len(outputs)):
+            print("output " + i+1 + ": ", outputs[i])
+        return outputs
+    
 def sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
-def standard_inference_loop(prompt, model, device, tokenizer, model_inputs, max_new_tokens=50):
+def standard_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=50):
     model_inputs = {
         key: value.clone()
         for key, value in model_inputs.items()
@@ -77,25 +95,32 @@ def standard_inference_loop(prompt, model, device, tokenizer, model_inputs, max_
     return output
     
 
-def cache_inference_loop(prompt, model, device, tokenizer, model_inputs, max_new_tokens=50):
+def cache_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=50):
     sync()
     start = time.perf_counter()
     model.eval()
+
+    batch_size = model_inputs["input_ids"].shape[0]
     with torch.inference_mode():
         past_key_values = None # we must manually manage key values
         #prefill step
         outputs = model(**model_inputs, past_key_values=past_key_values, use_cache=True) # use_cache=True tells pytorch to append key values to past key values
 
         past_key_values = outputs.past_key_values # store the past key values for the next iteration
-        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) #By default, a reduction like argmax removes the dimension it operates over. keep dim true same as unsqueeze above as model expects input of size [batch, seq_len]
-        generated_tokens = [next_token.item()] # store the generated token for the first iteration
+        next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) #By default, a reduction like argmax removes the dimension it operates over. keep dim true same as unsqueeze above as model expects input of size [batch, seq_len]
+        generated_tokens = [next_tokens.tolist()] # store generated tokens as list of lists to account for batch size
+        # Track which sequences in the batch have hit EOS
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
         sync()
         first_token_time = time.perf_counter()
         for i in range(max_new_tokens - 1): # we already generated one token, so we only need to generate max_new_tokens - 1 more
             outputs = model(next_token, past_key_values=past_key_values, use_cache=True) # pass in the next token and the past key values
             past_key_values = outputs.past_key_values
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) # keepdim=True to maintain the shape of the tensor for concatenation
-            generated_tokens.append(next_token.item())
+            next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True).tolist() # keepdim=True to maintain the shape of the tensor for concatenation
+            for b in range(batch_size):
+                generated_tokens[b].append(next_tokens[b][0])
+            
 
             if next_token == tokenizer.eos_token_id:
                 break
@@ -116,7 +141,6 @@ def cache_inference_loop(prompt, model, device, tokenizer, model_inputs, max_new
     print(f"Throughput: {throughput:.4f} tokens/second")
     output = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
     return output
-
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
