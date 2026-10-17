@@ -19,7 +19,7 @@ async def worker(engine, queue):
         # set a timeout (dynamic batching)
         try:
             async with asyncio.timeout(0.05):
-                while len(batch) < 3:
+                while len(batch) < 16: #max batch size
                     batch.append(await queue.get())
 
         except TimeoutError:

@@ -1,6 +1,6 @@
 # Inference benchmarks
 
-## Early single-request engine comparison
+## Early manual single-request engine comparison
 
 - Model: Qwen/Qwen2.5-0.5B-Instruct
 - GPU: RTX 5070
@@ -96,12 +96,9 @@ Raw measured waves, excluding warmups:
 | 5 | 1 | 1 | 512 | 9.697355 | 52.7979 |
 | 5 | 16 | 16 | 8192 | 9.882147 | 828.9697 |
 
-### Scope and resume wording
+### Scope
 
 These are warmed localhost burst measurements using one repeated prompt. They are not sustained mixed-prompt traffic results or production latency guarantees. The endpoint returns complete strings, so this test reports completion latency rather than streaming client TTFT.
 
 The HTTP workload generated 512 tokens per request, while the controlled engine benchmark generated 128. Differences between those tables cannot be attributed solely to HTTP or queue overhead.
 
-Resume wording supported by this HTTP test:
-
-> Built a FastAPI/Uvicorn inference server with asyncio request scheduling and static batching, scaling aggregate HTTP output throughput from 42 to 768 tokens/sec at batch size 16 on an RTX 5070 in localhost benchmarks.
