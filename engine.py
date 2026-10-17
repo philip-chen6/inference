@@ -156,6 +156,36 @@ def cache_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=
     output = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
     return output
 
+def draft(draft_model, model, tokenizer, next_tokens, attention_mask, past_key_values):
+    draft_model.eval()
+    with torch.inference_mode():
+        outputs = draft_model(next_tokens, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True)
+        past_key_values = outputs.past_key_values
+        next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    return next_tokens, past_key_values
+def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs, max_new_tokens=50):
+    sync()
+    start = time.perf_counter()
+    model.eval()
+
+    batch_size = model_inputs["input_ids"].shape[0]
+    with torch.inference_mode():
+        past_key_values = None # we must manually manage key values
+        #prefill step
+        outputs = model(**model_inputs, past_key_values=past_key_values, use_cache=True) # use_cache=True tells pytorch to append key values to past key values
+
+        past_key_values = outputs.past_key_values # store the past key values for the next iteration
+        next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) #By default, a reduction like argmax removes the dimension it operates over. keep dim true same as unsqueeze above as model expects input of size [batch, seq_len]
+        generated_tokens = next_tokens.tolist() # store generated tokens as list of lists to account for batch size
+        # Track which sequences in the batch have hit EOS
+        finished = next_tokens.squeeze(-1).eq(tokenizer.eos_token_id)
+        attention_mask = model_inputs["attention_mask"]
+
+        next_tokens = next_tokens.masked_fill(finished.unsqueeze(-1), tokenizer.pad_token_id) # replace "finished" sequences with pad token to avoid recording further tokens for them
+        sync()
+        first_token_time = time.perf_counter()
+        for i in range(max_new_tokens - 1):
+            draft(draft_model, model, tokenizer, next_tokens, attention_mask, past_key_values)
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype="auto", device_map="cuda:0")
