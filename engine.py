@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import time
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -156,36 +157,90 @@ def cache_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=
     output = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
     return output
 
-def draft(draft_model, model, tokenizer, next_tokens, attention_mask, past_key_values):
+def draft(draft_model, tokenizer, input_id, attention_mask, draft_cache, num_draft_tokens=5):
     draft_model.eval()
+    draft_sequence = input_id.clone() #entire draft sequence
+    next_token = input_id
+    draft_tokens = [] # drafted tokens
+    draft_probs = [] #store probabilities so we can accept based off confidence
     with torch.inference_mode():
-        outputs = draft_model(next_tokens, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True)
-        past_key_values = outputs.past_key_values
-        next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-    return next_tokens, past_key_values
-def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs, max_new_tokens=50):
+        for i in range(num_draft_tokens):
+            # extend attention mask for new token
+            attention_mask = torch.cat([attention_mask, attention_mask.new_ones(next_token.shape)], dim=-1)
+            outputs = draft_model(next_token, attention_mask=attention_mask, past_key_values=draft_cache, use_cache=True)
+            draft_cache = outputs.past_key_values
+            next_token_logits = outputs.logits[:, -1, :] # output logits has shape [batch_size, sequence_length, vocab_size]
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.argmax(probs, dim=-1, keepdim=True)
+            
+            
+            token_id = next_token.item()
+            draft_tokens.append(token_id)
+            draft_probs.append(probs[0, token_id].item()) # ordered by token, so you can access the probability at token_id
+            draft_sequence = torch.cat([draft_sequence, next_token], dim=1)
+            if next_token == tokenizer.eos_token_id:
+                break
+    return draft_sequence, draft_tokens, draft_probs, draft_cache #return cache so we can keep track between drafts.
+def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs, max_new_tokens=50, num_draft_tokens=5):
     sync()
     start = time.perf_counter()
     model.eval()
 
-    batch_size = model_inputs["input_ids"].shape[0]
+    # batch_size = model_inputs["input_ids"].shape[0]
     with torch.inference_mode():
         past_key_values = None # we must manually manage key values
         #prefill step
         outputs = model(**model_inputs, past_key_values=past_key_values, use_cache=True) # use_cache=True tells pytorch to append key values to past key values
 
-        past_key_values = outputs.past_key_values # store the past key values for the next iteration
-        next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) #By default, a reduction like argmax removes the dimension it operates over. keep dim true same as unsqueeze above as model expects input of size [batch, seq_len]
-        generated_tokens = next_tokens.tolist() # store generated tokens as list of lists to account for batch size
-        # Track which sequences in the batch have hit EOS
-        finished = next_tokens.squeeze(-1).eq(tokenizer.eos_token_id)
+        target_cache = outputs.past_key_values # store the past key values for the next iteration
+        input_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) #By default, a reduction like argmax removes the dimension it operates over. keep dim true same as unsqueeze above as model expects input of size [batch, seq_len]
         attention_mask = model_inputs["attention_mask"]
-
-        next_tokens = next_tokens.masked_fill(finished.unsqueeze(-1), tokenizer.pad_token_id) # replace "finished" sequences with pad token to avoid recording further tokens for them
+        
+        draft_outputs = draft_model(**model_inputs, use_cache=True)
+        draft_cache = draft_outputs.past_key_values
         sync()
         first_token_time = time.perf_counter()
-        for i in range(max_new_tokens - 1):
-            draft(draft_model, model, tokenizer, next_tokens, attention_mask, past_key_values)
+        i = 1
+        while i < max_new_tokens:
+            #draft 
+            draft_sequence, draft_tokens, draft_probs, draft_cache = draft(draft_model, tokenizer, input_tokens, attention_mask, draft_cache, num_draft_tokens)
+            # verification
+            
+            target_outputs = model(**draft_sequence)
+            target_probs = target_outputs.logits[0, -num_draft_tokens-1:-1, :] #get confidence for K tokens
+            
+            
+            # acceptance/rejection check
+            
+            accepted_tokens = []
+            for i in range(num_draft_tokens):
+                draft_token = draft_tokens[i]
+                p_draft = draft_probs[i]
+                p_model = target_probs[0, i, :]
+                if p_model >= p_draft:
+                    accepted_tokens.append(draft_token)
+                else:
+                    next_logit = target_probs[0, i, :]
+                    new_token = torch.argmax(next_logit).unsqueeze(0)
+                    accepted_tokens.append(new_token.item())
+                    break
+                
+            # if entire draft finishes, sample extra token for free
+            else:
+                final_logits = target_outputs.logits[:, -1, :]
+                extra_token = torch.argmax(final_logits, dim=-1).item()
+                accepted_tokens.append(extra_token)
+                #acceptance condition: if draft confidence >= model confidence keep, else discard
+            i += len(accepted_tokens)
+            input_tokens.cat([input_tokens, torch.tensor([accepted_tokens], device=device)], dim=1)
+            if accepted_tokens[-1] == tokenizer.eos_token_id:
+                break
+        
+        output = tokenizer.batch_decode(input_tokens, skip_special_tokens=True)
+        return output
+            
+            
+            
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype="auto", device_map="cuda:0")
