@@ -11,25 +11,29 @@ generation_lock = Lock()
 class GenerateRequest(BaseModel): #pydantic helps with serialization and validation of request data to match schemas
     prompt: str
 
-async def worker(engine, queue):
+async def worker(engine, queue, config):
     while True:
         # collect requests from queue, then make them (prompt, future) pair
         batch = [await queue.get()]
 
         # set a timeout (dynamic batching)
-        try:
-            async with asyncio.timeout(0.05):
-                while len(batch) < 16: #max batch size
-                    batch.append(await queue.get())
+        if config.batch:
+            try:
+                async with asyncio.timeout(config.batch_wait_s):
+                    while len(batch) < config.max_batch_size: #max batch size
+                        batch.append(await queue.get())
 
-        except TimeoutError:
-            # continue below with however many requests are collected
-            pass
+            except TimeoutError:
+                # continue below with however many requests are collected
+                pass
         try:
             prompts = [prompt for prompt, future in batch]
             
-            #to_thread so we can call synchronous blocking wfunctions outside of this thread to keep the asyncio event loop going
-            results = await asyncio.to_thread(engine.batch_generate, prompts)
+            if config.batch:
+                #to_thread so we can call synchronous blocking wfunctions outside of this thread to keep the asyncio event loop going
+                results = await asyncio.to_thread(engine.batch_generate, prompts)
+            else:
+                results = [await asyncio.to_thread(engine.generate, prompts[0])]
             for (prompt, future), output in zip(batch, results):
                 if not future.done(): #so an already canceled request doesn't crash the worker.
                     future.set_result(output)
@@ -47,11 +51,13 @@ async def worker(engine, queue):
 async def lifespan(app: FastAPI):
     # load model
     print("initializing engine")
-    engine = InferenceEngine("Qwen/Qwen2.5-0.5B-Instruct")
+    
+    config = app.state.config
+    engine = InferenceEngine(config)
     app.state.engine = engine #store engine in app state
     queue = asyncio.Queue()
     app.state.queue = queue
-    worker_task = asyncio.create_task(worker(engine, queue))
+    worker_task = asyncio.create_task(worker(engine, queue, config))
     
     try:
         yield

@@ -6,11 +6,19 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 class InferenceEngine:
 
-    def __init__(self, model):
+    def __init__(self, config):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = AutoModelForCausalLM.from_pretrained(model, dtype="auto").to(self.device)
-        self.tokenizer = AutoTokenizer.from_pretrained(model)
+        self.model = AutoModelForCausalLM.from_pretrained(config.model, dtype="auto").to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model)
         self.tokenizer.padding_side = "left"
+        self.config = config
+        self.draft_model = None
+        
+        if config.spec_decode:
+            self.draft_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype="auto").to(self.device)
+            draft_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+            if self.tokenizer.get_vocab() != draft_tokenizer.get_vocab():
+                raise ValueError("Target and draft token IDs must match.")
         
         print("model device: ", self.model.device)
 
@@ -23,8 +31,10 @@ class InferenceEngine:
         model_inputs = self.tokenizer.apply_chat_template( #instruct model
             messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True,
         ).to(self.device)
-                
-        output = cache_inference_loop(self.model, self.device, self.tokenizer, model_inputs, max_new_tokens=512)[0]
+        if self.draft_model is not None:
+            output = spec_dec_inference_loop(self.model, self.draft_model, self.device, self.tokenizer, model_inputs, max_new_tokens=512)[0]
+        else:
+            output = cache_inference_loop(self.model, self.device, self.tokenizer, model_inputs, max_new_tokens=512)[0]
         print("output: ", output)
         return output
 
@@ -159,7 +169,7 @@ def cache_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=
 
 def draft(draft_model, tokenizer, input_id, attention_mask, draft_cache, num_draft_tokens=5):
     draft_model.eval()
-    draft_sequence = input_id.clone() #entire draft sequence
+    draft_sequence = input_id.clone() #entire draft sequence including prompt
     next_token = input_id
     draft_tokens = [] # drafted tokens
     draft_probs = [] #store probabilities so we can accept based off confidence
@@ -191,7 +201,7 @@ def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs,
         past_key_values = None # we must manually manage key values
         #prefill step
         outputs = model(**model_inputs, past_key_values=past_key_values, use_cache=True) # use_cache=True tells pytorch to append key values to past key values
-
+        
         target_cache = outputs.past_key_values # store the past key values for the next iteration
         input_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) #By default, a reduction like argmax removes the dimension it operates over. keep dim true same as unsqueeze above as model expects input of size [batch, seq_len]
         attention_mask = model_inputs["attention_mask"]
@@ -201,28 +211,50 @@ def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs,
         sync()
         first_token_time = time.perf_counter()
         i = 1
-        while i < max_new_tokens:
+        while i < max_new_tokens and input_tokens[0, -1].item() != tokenizer.eos_token_id:
             #draft 
-            draft_sequence, draft_tokens, draft_probs, draft_cache = draft(draft_model, tokenizer, input_tokens, attention_mask, draft_cache, num_draft_tokens)
+            
+            #must rebuild this every time depending on accepted token shape.
+            history = torch.cat([model_inputs["input_ids"], input_tokens], dim=1)
+            prompt_mask = model_inputs["attention_mask"]
+            history_mask = torch.cat(
+                [prompt_mask, prompt_mask.new_ones(input_tokens.shape)], dim=1
+            )
+            
+            cached_length = draft_cache.get_seq_length()
+            draft_inputs = history[:, cached_length:]
+            draft_mask = history_mask[:, :cached_length]
+
+            draft_sequence, draft_tokens, draft_probs, draft_cache = draft(draft_model, tokenizer, draft_inputs, draft_mask, draft_cache, num_draft_tokens)
+            k = len(draft_tokens)
             # verification
             
-            target_outputs = model(**draft_sequence)
-            target_probs = target_outputs.logits[0, -num_draft_tokens-1:-1, :] #get confidence for K tokens
+            proposals = draft_sequence[:, draft_inputs.shape[1]:]
+
+            inputs = {
+                "input_ids": torch.cat([history[:, -1:], proposals], dim=1),
+                "attention_mask": torch.cat(
+                    [history_mask, history_mask.new_ones(proposals.shape)], dim=1
+                ),
+            }
+
+            target_outputs = model(**inputs, past_key_values=target_cache, use_cache=True)
+            target_cache = target_outputs.past_key_values
+            target_logits = target_outputs.logits[:, -(k+1):-1, :] #get confidence for K tokens
             
             
             # acceptance/rejection check
             
             accepted_tokens = []
-            for i in range(num_draft_tokens):
-                draft_token = draft_tokens[i]
-                p_draft = draft_probs[i]
-                p_model = target_probs[0, i, :]
-                if p_model >= p_draft:
+            for j in range(k):
+                draft_token = draft_tokens[j]
+                # p_draft = draft_probs[j]
+                # p_model = target_probs[0, j, :]
+                target_token = target_logits[0, j, :].argmax().item()
+                if target_token == draft_token:
                     accepted_tokens.append(draft_token)
                 else:
-                    next_logit = target_probs[0, i, :]
-                    new_token = torch.argmax(next_logit).unsqueeze(0)
-                    accepted_tokens.append(new_token.item())
+                    accepted_tokens.append(target_token)
                     break
                 
             # if entire draft finishes, sample extra token for free
@@ -231,11 +263,31 @@ def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs,
                 extra_token = torch.argmax(final_logits, dim=-1).item()
                 accepted_tokens.append(extra_token)
                 #acceptance condition: if draft confidence >= model confidence keep, else discard
+                
+            accepted_tokens = accepted_tokens[:max_new_tokens - i] #so we don't go over max
+            hit_eos = False
+            for position, token in enumerate(accepted_tokens): #end might not be at very last accepted token.
+                if token == tokenizer.eos_token_id:
+                    accepted_tokens = accepted_tokens[:position + 1]
+                    hit_eos = True
+                    break
             i += len(accepted_tokens)
-            input_tokens.cat([input_tokens, torch.tensor([accepted_tokens], device=device)], dim=1)
-            if accepted_tokens[-1] == tokenizer.eos_token_id:
+            input_tokens = torch.cat([input_tokens, torch.tensor([accepted_tokens], device=device)], dim=1)
+            # get rid of extra drafted tokens after EOS, if any
+            cache_limit = model_inputs["input_ids"].shape[1] + input_tokens.shape[1] - 1
+            for cache in (draft_cache, target_cache):
+                excess = cache.get_seq_length() - cache_limit
+                if excess > 0:
+                    cache.crop(-excess)
+            if hit_eos:
                 break
-        
+        sync()
+        elapsed = time.perf_counter() - start
+        generated = input_tokens.shape[1]
+
+        print(f"Generation time: {elapsed:.3f}s")
+        print(f"Generated tokens: {generated}")
+        print(f"Throughput: {generated / elapsed:.2f} tokens/s")
         output = tokenizer.batch_decode(input_tokens, skip_special_tokens=True)
         return output
             
