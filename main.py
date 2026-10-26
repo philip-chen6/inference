@@ -6,7 +6,7 @@ from server import app
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--max-batch-size", type=int, default=16)
     parser.add_argument("--batch-wait-s", type=float, default=0.05)
 

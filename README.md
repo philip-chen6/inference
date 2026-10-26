@@ -24,7 +24,7 @@ uv run --locked python -c "import torch, fastapi, uvicorn; print(torch.__version
 Start the server:
 
 ```powershell
-uv run --locked uvicorn server:app --host 127.0.0.1 --port 8000 --workers 1
+uv run python main.py --spec-decode --model Qwen/Qwen2.5-1.5B-Instruct
 ```
 
 The current `/generate` endpoint accepts `prompt` as a query parameter.

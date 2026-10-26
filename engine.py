@@ -32,7 +32,7 @@ class InferenceEngine:
             messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True,
         ).to(self.device)
         if self.draft_model is not None:
-            output = spec_dec_inference_loop(self.model, self.draft_model, self.device, self.tokenizer, model_inputs, max_new_tokens=512)[0]
+            output = spec_dec_inference_loop(self.model, self.draft_model, self.device, self.tokenizer, model_inputs, max_new_tokens=512, num_draft_tokens=3)[0]
         else:
             output = cache_inference_loop(self.model, self.device, self.tokenizer, model_inputs, max_new_tokens=512)[0]
         print("output: ", output)
@@ -106,7 +106,7 @@ def standard_inference_loop(model, device, tokenizer, model_inputs, max_new_toke
     return output
     
 
-def cache_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=50):
+def cache_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=50, method="sample", temperature=0.6):
     sync()
     start = time.perf_counter()
     model.eval()
@@ -116,9 +116,15 @@ def cache_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=
         past_key_values = None # we must manually manage key values
         #prefill step
         outputs = model(**model_inputs, past_key_values=past_key_values, use_cache=True) # use_cache=True tells pytorch to append key values to past key values
-
         past_key_values = outputs.past_key_values # store the past key values for the next iteration
-        next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) #By default, a reduction like argmax removes the dimension it operates over. keep dim true same as unsqueeze above as model expects input of size [batch, seq_len]
+        
+        logits = outputs.logits[:, -1, :]
+        if method == "sample":
+            logits = logits / temperature
+            probs = torch.softmax(logits, dim=1)
+            next_tokens = torch.multinomial(probs, num_samples=1) 
+        else:
+            next_tokens = torch.argmax(logits, dim=-1, keepdim=True) #By default, a reduction like argmax removes the dimension it operates over. keep dim true same as unsqueeze above as model expects input of size [batch, seq_len]
         generated_tokens = next_tokens.tolist() # store generated tokens as list of lists to account for batch size
         # Track which sequences in the batch have hit EOS
         finished = next_tokens.squeeze(-1).eq(tokenizer.eos_token_id)
@@ -135,7 +141,13 @@ def cache_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=
             
             outputs = model(next_tokens, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True) # pass in the next token and the past key values
             past_key_values = outputs.past_key_values
-            next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) # keepdim=True to maintain the shape of the tensor for concatenation
+            logits = outputs.logits[:, -1, :]
+            if method == "sample":
+                logits = logits / temperature
+                probs = torch.softmax(logits, dim=1)
+                next_tokens = torch.multinomial(probs, num_samples=1) 
+            else:
+                next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
             token_ids = next_tokens.squeeze(-1)
             token_values = token_ids.tolist()
             already_finished = finished.tolist()
@@ -167,11 +179,10 @@ def cache_inference_loop(model, device, tokenizer, model_inputs, max_new_tokens=
     output = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
     return output
 
-def draft(draft_model, tokenizer, input_id, attention_mask, draft_cache, num_draft_tokens=5):
+def draft(draft_model, tokenizer, input_id, attention_mask, draft_cache, num_draft_tokens=5, method="sample", temperature=0.6):
     draft_model.eval()
-    draft_sequence = input_id.clone() #entire draft sequence including prompt
+    draft_sequence = input_id.clone() #store drafted sequence
     next_token = input_id
-    draft_tokens = [] # drafted tokens
     draft_probs = [] #store probabilities so we can accept based off confidence
     with torch.inference_mode():
         for i in range(num_draft_tokens):
@@ -179,23 +190,25 @@ def draft(draft_model, tokenizer, input_id, attention_mask, draft_cache, num_dra
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(next_token.shape)], dim=-1)
             outputs = draft_model(next_token, attention_mask=attention_mask, past_key_values=draft_cache, use_cache=True)
             draft_cache = outputs.past_key_values
-            next_token_logits = outputs.logits[:, -1, :] # output logits has shape [batch_size, sequence_length, vocab_size]
-            probs = F.softmax(next_token_logits, dim=-1)
-            next_token = torch.argmax(probs, dim=-1, keepdim=True)
+            logits = outputs.logits[:, -1, :].float() # output logits has shape [batch_size, sequence_length, vocab_size]
+            logits = logits / temperature
+            probs = torch.softmax(logits, dim=1)
+            if method == "sample":
+                next_token = torch.multinomial(probs, num_samples=1) 
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)            
             
-            
-            token_id = next_token.item()
-            draft_tokens.append(token_id)
-            draft_probs.append(probs[0, token_id].item()) # ordered by token, so you can access the probability at token_id
+            draft_probs.append(probs[0]) # ordered by token, so you can access the probability at token_id
             draft_sequence = torch.cat([draft_sequence, next_token], dim=1)
             if next_token == tokenizer.eos_token_id:
                 break
-    return draft_sequence, draft_tokens, draft_probs, draft_cache #return cache so we can keep track between drafts.
-def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs, max_new_tokens=50, num_draft_tokens=5):
+    return draft_sequence, draft_probs, draft_cache #return cache so we can keep track between drafts.
+def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs, max_new_tokens=50, num_draft_tokens=5, method="sample", temperature=0.6):
     sync()
     start = time.perf_counter()
     model.eval()
-
+    accepted_drafts = 0
+    proposed_drafts = 0
     # batch_size = model_inputs["input_ids"].shape[0]
     with torch.inference_mode():
         past_key_values = None # we must manually manage key values
@@ -203,15 +216,24 @@ def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs,
         outputs = model(**model_inputs, past_key_values=past_key_values, use_cache=True) # use_cache=True tells pytorch to append key values to past key values
         
         target_cache = outputs.past_key_values # store the past key values for the next iteration
-        input_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True) #By default, a reduction like argmax removes the dimension it operates over. keep dim true same as unsqueeze above as model expects input of size [batch, seq_len]
-        attention_mask = model_inputs["attention_mask"]
+        
+        logits = outputs.logits[:, -1, :].float()
+        if method == "sample":
+            logits = logits / temperature
+            probs = torch.softmax(logits, dim=1)
+            input_tokens = torch.multinomial(probs, num_samples=1) 
+        else:
+            input_tokens = torch.argmax(logits, dim=-1, keepdim=True)
         
         draft_outputs = draft_model(**model_inputs, use_cache=True)
         draft_cache = draft_outputs.past_key_values
         sync()
         first_token_time = time.perf_counter()
+        
+        time_drafting = 0.0
+        time_verifying = 0.0
         i = 1
-        while i < max_new_tokens and input_tokens[0, -1].item() != tokenizer.eos_token_id:
+        while i < max_new_tokens:
             #draft 
             
             #must rebuild this every time depending on accepted token shape.
@@ -224,12 +246,13 @@ def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs,
             cached_length = draft_cache.get_seq_length()
             draft_inputs = history[:, cached_length:]
             draft_mask = history_mask[:, :cached_length]
-
-            draft_sequence, draft_tokens, draft_probs, draft_cache = draft(draft_model, tokenizer, draft_inputs, draft_mask, draft_cache, num_draft_tokens)
-            k = len(draft_tokens)
+            draft_time = time.perf_counter()
+            draft_sequence, draft_probs, draft_cache = draft(draft_model, tokenizer, draft_inputs, draft_mask, draft_cache, num_draft_tokens, method, temperature)
+            time_drafting += time.perf_counter() - draft_time
             # verification
             
             proposals = draft_sequence[:, draft_inputs.shape[1]:]
+            k = proposals.shape[1]
 
             inputs = {
                 "input_ids": torch.cat([history[:, -1:], proposals], dim=1),
@@ -237,50 +260,76 @@ def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs,
                     [history_mask, history_mask.new_ones(proposals.shape)], dim=1
                 ),
             }
-
+            verify_time = time.perf_counter()
             target_outputs = model(**inputs, past_key_values=target_cache, use_cache=True)
-            target_cache = target_outputs.past_key_values
-            target_logits = target_outputs.logits[:, -(k+1):-1, :] #get confidence for K tokens
             
+            time_verifying += time.perf_counter() - verify_time
+            target_cache = target_outputs.past_key_values
+            target_logits = target_outputs.logits[:, -(k+1):-1, :].float() #convert to float so that precise values aren't lost for the sampling logic
+            target_probs = F.softmax(target_logits[0, :, :] / temperature, dim = -1)
             
             # acceptance/rejection check
             
             accepted_tokens = []
+            proposed_drafts += k
             for j in range(k):
-                draft_token = draft_tokens[j]
-                # p_draft = draft_probs[j]
-                # p_model = target_probs[0, j, :]
-                target_token = target_logits[0, j, :].argmax().item()
-                if target_token == draft_token:
-                    accepted_tokens.append(draft_token)
+                draft_token = proposals[0, j].item()
+                if method == "sample":
+                    q = draft_probs[j]
+                    p = target_probs[j]
+                    
+                    accept_prob = (p[draft_token] / q[draft_token]).clamp(max=1.0) #handle both p>=q and accept case of p < q
+                    u = torch.rand((), device=p.device)
+                    
+                    if u < accept_prob: #accept with probability
+                        accepted_tokens.append(draft_token)
+                        accepted_drafts += 1
+                        if draft_token == tokenizer.eos_token_id:
+                            break
+                    else:
+                        new_distribution = torch.clamp(p-q, min=0.0) # as outlined in paper, this is lossless.
+                        target_token = torch.multinomial(new_distribution, num_samples=1).item() #normalization auto applied in multinomial
+                        accepted_tokens.append(target_token)
+                        break                
                 else:
-                    accepted_tokens.append(target_token)
-                    break
+                    target_token = target_logits[0, j, :].argmax().item()
+                    if target_token == draft_token:
+                        accepted_tokens.append(draft_token)
+                        accepted_drafts += 1
+                        if target_token == tokenizer.eos_token_id:
+                            break
+                    else:
+                        accepted_tokens.append(target_token)
+                        break
+                
                 
             # if entire draft finishes, sample extra token for free
             else:
-                final_logits = target_outputs.logits[:, -1, :]
-                extra_token = torch.argmax(final_logits, dim=-1).item()
-                accepted_tokens.append(extra_token)
-                #acceptance condition: if draft confidence >= model confidence keep, else discard
+                final_logits = target_outputs.logits[:, -1, :].float()
+                if method == "sample":
+                    final_logits = final_logits / temperature
+                    probs = torch.softmax(final_logits, dim=1)
+                    extra_token = torch.multinomial(probs, num_samples=1) 
+                else:
+                    extra_token = torch.argmax(final_logits, dim=-1, keepdim=True)
+                accepted_tokens.append(extra_token.item())
                 
             accepted_tokens = accepted_tokens[:max_new_tokens - i] #so we don't go over max
-            hit_eos = False
-            for position, token in enumerate(accepted_tokens): #end might not be at very last accepted token.
-                if token == tokenizer.eos_token_id:
-                    accepted_tokens = accepted_tokens[:position + 1]
-                    hit_eos = True
-                    break
             i += len(accepted_tokens)
+            
+            # commit accepted tokens
             input_tokens = torch.cat([input_tokens, torch.tensor([accepted_tokens], device=device)], dim=1)
-            # get rid of extra drafted tokens after EOS, if any
-            cache_limit = model_inputs["input_ids"].shape[1] + input_tokens.shape[1] - 1
+            
+            if accepted_tokens[-1] == tokenizer.eos_token_id:
+                break
+            # get rid of rejected proposals from target cache: prompt + accepted tokens is max length
+            cache_limit = model_inputs["input_ids"].shape[1] + input_tokens.shape[1] - 1 # picked token isnt in cache yet.
+            # if longer, then get rid of excess.
             for cache in (draft_cache, target_cache):
                 excess = cache.get_seq_length() - cache_limit
                 if excess > 0:
                     cache.crop(-excess)
-            if hit_eos:
-                break
+
         sync()
         elapsed = time.perf_counter() - start
         generated = input_tokens.shape[1]
@@ -288,6 +337,10 @@ def spec_dec_inference_loop(model, draft_model, device, tokenizer, model_inputs,
         print(f"Generation time: {elapsed:.3f}s")
         print(f"Generated tokens: {generated}")
         print(f"Throughput: {generated / elapsed:.2f} tokens/s")
+        print(f"Accepted draft tokens: {accepted_drafts}")
+        print(f"Acceptance rate: {accepted_drafts/proposed_drafts}")
+        print(f"Drafting time: {time_drafting:.3f}s")
+        print(f"Target verification time: {time_verifying:.3f}s")    
         output = tokenizer.batch_decode(input_tokens, skip_special_tokens=True)
         return output
             
