@@ -1,7 +1,6 @@
 # inference
 
-learning stuff
-
+Attempting to learn what vLLM does! Goal is to implement decoding loop, KV cache, speculative decoding, batching, quantization, paged attention, and a few kernels. Writing this all by hand!
 ## Setup
 
 Install uv, then recreate the project environment on each computer:
